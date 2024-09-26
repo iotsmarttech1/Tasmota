@@ -25,6 +25,10 @@
 #include "include/tasmota_version.h"        // Tasmota version information
 #include "include/tasmota.h"                // Enumeration used in my_user_config.h
 #include "my_user_config.h"                 // Fixed user configurable options
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
+#include "esp_flash_encrypt.h"
+
 #ifdef USE_TLS
 #include <t_bearssl.h>                      // We need to include before "tasmota_globals.h" to take precedence over the BearSSL version in Arduino
 #endif  // USE_TLS
@@ -38,6 +42,10 @@
 #if !LWIP_IPV6
 #undef USE_IPV6
 #endif
+
+#define FLASH_ENCR_TAG "FLASH_ENCR"
+#define FLASH_ENCRYPTION_KEY_SIZE 32  // 256-bit key size
+
 
 // Libraries
 #include <WiFiHelper.h>
@@ -313,8 +321,8 @@ struct TasmotaGlobal_t {
   bool blinkstate;                          // LED state
   bool pwm_present;                         // Any PWM channel configured with SetOption15 0
   bool i2c_enabled;                         // I2C configured
-  bool i2c_enabled_2;                       // I2C configured, second controller, Wire1
 #ifdef ESP32
+  bool i2c_enabled_2;                       // I2C configured, second controller on ESP32, Wire1
   bool ota_factory;                         // Select safeboot binary
 #endif
   bool ntp_force_sync;                      // Force NTP sync
@@ -501,9 +509,9 @@ void setup(void) {
     TasConsole.println();
     AddLog(LOG_LEVEL_INFO, PSTR("CMD: Using USB CDC"));
   } else {
-#if SOC_USB_SERIAL_JTAG_SUPPORTED  // Not S2
+    #if SOC_USB_SERIAL_JTAG_SUPPORTED  // Not S2
     HWCDCSerial.~HWCDC();       // not needed, deinit CDC
-#endif  // SOC_USB_SERIAL_JTAG_SUPPORTED
+    #endif  // SOC_USB_SERIAL_JTAG_SUPPORTED
     // Init command serial console preparing for AddLog use
     Serial.begin(TasmotaGlobal.baudrate);
     Serial.println();
@@ -540,6 +548,66 @@ void setup(void) {
 #ifdef ESP32
   AddLog(LOG_LEVEL_INFO, PSTR("HDW: %s %s"), GetDeviceHardwareRevision().c_str(),
             FoundPSRAM() ? (CanUsePSRAM() ? "(PSRAM)" : "(PSRAM disabled)") : "" );
+
+    esp_err_t err;
+
+    // Check if flash encryption is already enabled
+    if (esp_flash_encryption_enabled()) {
+      ESP_LOGI(FLASH_ENCR_TAG, "Flash encryption is already enabled.");  
+    }
+    else
+    {
+      ESP_LOGI(FLASH_ENCR_TAG, "Flash encryption enable process start");  
+        // Generate a 256-bit flash encryption key
+      uint8_t flash_encryption_key[FLASH_ENCRYPTION_KEY_SIZE] = {
+          0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+          0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+          0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+          0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89
+      };
+
+      // Write the encryption key to BLOCK_KEY0
+      err = esp_efuse_write_field_blob(ESP_EFUSE_KEY0, flash_encryption_key, 256);
+      if (err != ESP_OK) {
+          ESP_LOGE(FLASH_ENCR_TAG, "Failed to write the flash encryption key: %s", esp_err_to_name(err));
+          return;
+      }
+      ESP_LOGI(FLASH_ENCR_TAG, "Flash encryption key written successfully.");
+
+      // Set the purpose of BLOCK_KEY0 to XTS_AES_256_KEY_1
+      int key_purpose_1 = ESP_EFUSE_KEY_PURPOSE_XTS_AES_256_KEY_1;
+      err = esp_efuse_write_field_blob(ESP_EFUSE_KEY_PURPOSE_0, &key_purpose_1, 4);
+      if (err != ESP_OK) {
+          ESP_LOGE(FLASH_ENCR_TAG, "Failed to set the key purpose for BLOCK_KEY0: %s", esp_err_to_name(err));
+          return;
+      }
+      ESP_LOGI(FLASH_ENCR_TAG, "Key purpose for BLOCK_KEY0 set successfully.");
+
+      // Set the purpose of BLOCK_KEY1 to XTS_AES_256_KEY_2
+      int key_purpose_2 = ESP_EFUSE_KEY_PURPOSE_XTS_AES_256_KEY_2;
+      err = esp_efuse_write_field_blob(ESP_EFUSE_KEY_PURPOSE_1, &key_purpose_2, 4);
+      if (err != ESP_OK) {
+          ESP_LOGE(FLASH_ENCR_TAG, "Failed to set the key purpose for BLOCK_KEY1: %s", esp_err_to_name(err));
+          return;
+      }
+      ESP_LOGI(FLASH_ENCR_TAG, "Key purpose for BLOCK_KEY1 set successfully.");
+
+      // Burn SPI_BOOT_CRYPT_CNT eFuse to enable flash encryption
+      err = esp_efuse_write_field_bit(ESP_EFUSE_SPI_BOOT_CRYPT_CNT);
+      if (err != ESP_OK) {
+          ESP_LOGE(FLASH_ENCR_TAG, "Failed to enable SPI boot crypt count: %s", esp_err_to_name(err));
+          return;
+      }
+      ESP_LOGI(FLASH_ENCR_TAG, "SPI_BOOT_CRYPT_CNT burned successfully. Flash encryption enabled.");
+
+      // Write-protect the keys and key purposes to prevent changes
+      esp_efuse_write_field_bit(ESP_EFUSE_WR_DIS_KEY0);
+      esp_efuse_write_field_bit(ESP_EFUSE_WR_DIS_KEY1);
+      esp_efuse_write_field_bit(ESP_EFUSE_WR_DIS_KEY_PURPOSE_0);
+      esp_efuse_write_field_bit(ESP_EFUSE_WR_DIS_KEY_PURPOSE_1);
+      ESP_LOGI(FLASH_ENCR_TAG, "Flash encryption keys and key purposes are now write-protected.");
+    }
+
   // AddLog(LOG_LEVEL_DEBUG, PSTR("HDW: FoundPSRAM=%i CanUsePSRAM=%i"), FoundPSRAM(), CanUsePSRAM());
 #if !defined(HAS_PSRAM_FIX)
   if (FoundPSRAM() && !CanUsePSRAM()) {
